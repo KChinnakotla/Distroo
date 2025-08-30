@@ -1,0 +1,17 @@
+syntax = "proto3";
+package kv;
+
+message PutRequest { string key = 1; bytes value = 2; string client_id = 3; string op_id = 4; }
+message PutResponse { bool committed = 1; string leader = 2; }
+
+message GetRequest { string key = 1; }
+message GetResponse { bytes value = 1; bool found = 2; string leader = 3; }
+
+message DeleteRequest { string key = 1; string client_id = 2; string op_id = 3; }
+message DeleteResponse { bool committed = 1; string leader = 2; }
+
+service KV {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}

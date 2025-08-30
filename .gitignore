@@ -1,0 +1,52 @@
+# Binaries (Go builds)
+kvnode
+kvctl
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Output from go build / install
+/bin/
+/out/
+/build/
+
+# Go coverage / test output
+*.out
+*.coverprofile
+*.cover
+coverage/
+
+# IDE/editor stuff
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dependency directories (if using vendoring)
+vendor/
+
+# Local Raft data directories
+data/
+.data/
+**/wal.log
+
+# Docker volumes (in case you mount locally)
+kv1data/
+kv2data/
+kv3data/
+
+# Cache
+__pycache__/
+*.tmp
+*.bak
