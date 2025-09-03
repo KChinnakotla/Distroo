@@ -281,7 +281,7 @@ func (n *Node) startElection() {
 	if n.role != Candidate || n.term != term {
 		return
 	}
-
+	// If we got enough votes, become leader
 	total := len(peers) + 1
 	if votes*2 > total {
 		// become leader
