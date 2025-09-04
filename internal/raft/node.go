@@ -2,349 +2,392 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"log"
-	"math/rand"
 	"net/http"
 	"sync"
 	"time"
 )
 
-type Role string
+type role int
 
 const (
-	Follower  Role = "follower"
-	Candidate Role = "candidate"
-	Leader    Role = "leader"
+	follower role = iota
+	candidate
+	leader
 )
 
-type Config struct {
-	ID        string
-	Advertise string   // e.g., http://kv1:8080
-	DataDir   string
-	Peers     []string
-	Logger    *log.Logger
+type peer struct {
+	ID   string
+	Addr string // base URL like http://kv2:8080
 }
 
-type Node struct {
+type RaftNode struct {
 	mu sync.Mutex
 
-	id        string
-	advertise string
-	peers     []string
-	log       *log.Logger
-
-	role Role
-
-	term     int
+	id      string
+	addr    string
+	peers   []peer
+	role    role
+	term    uint64
 	votedFor string
 
-	leaderID   string
-	leaderAddr string
+	log         *Log
+	commitIndex uint64
+	lastApplied uint64
+
+	// Leader-only replication state
+	nextIndex  map[string]uint64
+	matchIndex map[string]uint64
+
+	// Apply channel for committed entries -> KV layer
+	applyCh chan ApplyMsg
+
+	// Waiters: entry index -> chans to signal once committed
+	waiters map[uint64][]chan struct{}
 
 	// timers
-	electionReset time.Time
-	httpClient    *http.Client
+	heartbeatTicker *time.Ticker
+	electionTimer   *time.Timer
 
-	// stop
-	stopCh chan struct{}
+	httpClient *http.Client
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-func NewNode(cfg Config) *Node {
-	n := &Node{
-		id:            cfg.ID,
-		advertise:     cfg.Advertise,
-		peers:         append([]string(nil), cfg.Peers...),
-		log:           cfg.Logger,
-		role:          Follower,
-		term:          0,
-		votedFor:      "",
-		electionReset: time.Now(),
-		httpClient:    &http.Client{Timeout: 800 * time.Millisecond},
-		stopCh:        make(chan struct{}),
+func NewRaftNode(id, addr string, peers []peer) *RaftNode {
+	ctx, cancel := context.WithCancel(context.Background())
+	rn := &RaftNode{
+		id:       id,
+		addr:     addr,
+		peers:    peers,
+		role:     follower,
+		term:     0,
+		log:      NewLog(),
+		applyCh:  make(chan ApplyMsg, 1024),
+		waiters:  make(map[uint64][]chan struct{}),
+		httpClient: &http.Client{
+			Timeout: 2 * time.Second,
+		},
+		ctx:    ctx,
+		cancel: cancel,
 	}
-	return n
+	rn.resetElectionTimer()
+	return rn
 }
 
-func (n *Node) IsLeader() bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.role == Leader
-}
+func (rn *RaftNode) ApplyCh() <-chan ApplyMsg { return rn.applyCh }
 
-type LeaderView struct {
-	LeaderID   string `json:"leader_id"`
-	LeaderAddr string `json:"leader_addr"`
-	IsLeader   bool   `json:"is_leader"`
-	SelfID     string `json:"self_id"`
-}
+// ---------- Public API called by KV layer ----------
 
-func (n *Node) LeaderInfo() LeaderView {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return LeaderView{
-		LeaderID:   n.leaderID,
-		LeaderAddr: n.leaderAddr,
-		IsLeader:   n.role == Leader,
-		SelfID:     n.id,
+// StartCommand is called by the leader to replicate a client command.
+// It returns (index, term, okLeader).
+func (rn *RaftNode) StartCommand(data []byte) (uint64, uint64, bool) {
+	rn.mu.Lock()
+	if rn.role != leader {
+		rn.mu.Unlock()
+		return 0, rn.term, false
 	}
-}
+	// Append to leader log
+	idx := rn.log.LastIndex() + 1
+	ent := Entry{Index: idx, Term: rn.term, Data: append([]byte(nil), data...)}
+	rn.log.Append(ent)
 
-func (n *Node) RegisterHTTP(mux *http.ServeMux) {
-	mux.HandleFunc("/raft/leader", n.handleLeader)
-	mux.HandleFunc("/raft/state", n.handleState)
-	mux.HandleFunc("/raft/requestvote", n.handleRequestVote)
-	mux.HandleFunc("/raft/append", n.handleAppendEntries)
-}
+	// Register a waiter to let HTTP handler block until commit
+	ch := make(chan struct{}, 1)
+	rn.waiters[idx] = append(rn.waiters[idx], ch)
 
-func (n *Node) handleLeader(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, n.LeaderInfo())
-}
-
-func (n *Node) handleState(w http.ResponseWriter, r *http.Request) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":          n.id,
-		"role":        n.role,
-		"term":        n.term,
-		"voted_for":   n.votedFor,
-		"leader_id":   n.leaderID,
-		"leader_addr": n.leaderAddr,
-	})
-}
-
-type requestVoteReq struct {
-	Term        int    `json:"term"`
-	CandidateID string `json:"candidate_id"`
-	// For real Raft you'd include lastLogIndex/lastLogTerm
-}
-
-type requestVoteResp struct {
-	Term        int  `json:"term"`
-	VoteGranted bool `json:"vote_granted"`
-}
-
-func (n *Node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
-	var req requestVoteReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
-		return
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if req.Term > n.term {
-		n.becomeFollowerLocked(req.Term, "")
-	}
-
-	resp := requestVoteResp{Term: n.term, VoteGranted: false}
-
-	if req.Term < n.term {
-		writeJSON(w, http.StatusOK, resp)
-		return
-	}
-
-	// grant if not voted this term or already voted for candidate
-	if n.votedFor == "" || n.votedFor == req.CandidateID {
-		n.votedFor = req.CandidateID
-		resp.VoteGranted = true
-		n.electionReset = time.Now()
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-type appendEntriesReq struct {
-	Term     int    `json:"term"`
-	LeaderID string `json:"leader_id"`
-	// entries omitted for scaffold heartbeat
-}
-
-type appendEntriesResp struct {
-	Term    int  `json:"term"`
-	Success bool `json:"success"`
-}
-
-func (n *Node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
-	var req appendEntriesReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
-		return
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if req.Term >= n.term {
-		n.becomeFollowerLocked(req.Term, req.LeaderID)
-		n.electionReset = time.Now()
-	}
-	writeJSON(w, http.StatusOK, appendEntriesResp{Term: n.term, Success: true})
-}
-
-func (n *Node) Run() {
-	// election loop
-	go func() {
-		for {
-			select {
-			case <-n.stopCh:
-				return
-			default:
+	// Kick off replication (async)
+	term := rn.term
+	peers := append([]peer(nil), rn.peers...)
+	if rn.nextIndex == nil {
+		rn.nextIndex = make(map[string]uint64)
+		rn.matchIndex = make(map[string]uint64)
+		for _, p := range peers {
+			if p.ID == rn.id {
+				continue
 			}
-
-			role := n.getRole()
-			switch role {
-			case Leader:
-				n.sendHeartbeats()
-				time.Sleep(100 * time.Millisecond)
-			default:
-				// follower/candidate
-				timeout := electionTimeout()
-				if time.Since(n.getElectionReset()) > timeout {
-					n.startElection()
-				}
-				time.Sleep(25 * time.Millisecond)
-			}
+			rn.nextIndex[p.ID] = rn.log.LastIndex() // next entry to send
+			rn.matchIndex[p.ID] = 0
 		}
-	}()
-}
-
-func (n *Node) getRole() Role {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.role
-}
-
-func (n *Node) getElectionReset() time.Time {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.electionReset
-}
-
-func electionTimeout() time.Duration {
-	// 500-900ms
-	return time.Duration(500+rand.Intn(400)) * time.Millisecond
-}
-
-func (n *Node) startElection() {
-	n.mu.Lock()
-	n.role = Candidate
-	n.term++
-	n.votedFor = n.id
-	term := n.term
-	n.electionReset = time.Now()
-	peers := append([]string(nil), n.peers...)
-	self := n.advertise
-	n.mu.Unlock()
-
-	if n.log != nil {
-		n.log.Printf("election started: term=%d", term)
 	}
+	rn.mu.Unlock()
 
-	votes := 1 // self vote
+	go rn.replicateToAll(term)
+
+	return idx, term, true
+}
+
+// WaitForCommit blocks (up to timeout) until index is committed.
+func (rn *RaftNode) WaitForCommit(index uint64, timeout time.Duration) bool {
+	rn.mu.Lock()
+	// fast path: already committed
+	if rn.commitIndex >= index {
+		rn.mu.Unlock()
+		return true
+	}
+	ch := make(chan struct{}, 1)
+	rn.waiters[index] = append(rn.waiters[index], ch)
+	rn.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// ---------- Leader replication loop ----------
+
+func (rn *RaftNode) replicateToAll(term uint64) {
 	var wg sync.WaitGroup
-	var muVotes sync.Mutex
-
-	for _, peer := range peers {
+	for _, p := range rn.peers {
+		if p.ID == rn.id {
+			continue
+		}
 		wg.Add(1)
-		go func(p string) {
+		go func(pp peer) {
 			defer wg.Done()
-			req := requestVoteReq{Term: term, CandidateID: n.id}
-			b, _ := json.Marshal(req)
-			resp, err := n.httpClient.Post(p+"/raft/requestvote", "application/json", bytes.NewReader(b))
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-			var rvr requestVoteResp
-			_ = json.NewDecoder(resp.Body).Decode(&rvr)
-
-			n.mu.Lock()
-			if rvr.Term > n.term {
-				n.becomeFollowerLocked(rvr.Term, "")
-			}
-			n.mu.Unlock()
-
-			if rvr.VoteGranted {
-				muVotes.Lock()
-				votes++
-				muVotes.Unlock()
-			}
-		}(peer)
-	}
-	wg.Wait()
-
-	// Determine majority
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	// If we stepped down, abort
-	if n.role != Candidate || n.term != term {
-		return
-	}
-	// If we got enough votes, become leader
-	total := len(peers) + 1
-	if votes*2 > total {
-		// become leader
-		n.role = Leader
-		n.leaderID = n.id
-		n.leaderAddr = self
-		if n.log != nil {
-			n.log.Printf("became leader (term=%d) with %d/%d votes", term, votes, total)
-		}
-	} else {
-		// stay follower (give up this round)
-		n.role = Follower
-		n.votedFor = ""
-		n.electionReset = time.Now()
-		if n.log != nil {
-			n.log.Printf("election lost (votes=%d/%d), back to follower", votes, total)
-		}
-	}
-}
-
-func (n *Node) becomeFollowerLocked(term int, leaderID string) {
-	if term > n.term {
-		n.term = term
-		n.votedFor = ""
-	}
-	n.role = Follower
-	n.leaderID = leaderID
-	// if leaderID known, set leaderAddr if this is in peers/self
-	if leaderID == n.id {
-		n.leaderAddr = n.advertise
-	}
-}
-
-func (n *Node) sendHeartbeats() {
-	n.mu.Lock()
-	term := n.term
-	peers := append([]string(nil), n.peers...)
-	leaderID := n.id
-	n.mu.Unlock()
-
-	req := appendEntriesReq{Term: term, LeaderID: leaderID}
-	b, _ := json.Marshal(req)
-
-	for _, p := range peers {
-		go func(url string) {
-			resp, err := n.httpClient.Post(url+"/raft/append", "application/json", bytes.NewReader(b))
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-			var ar appendEntriesResp
-			_ = json.NewDecoder(resp.Body).Decode(&ar)
-			n.mu.Lock()
-			if ar.Term > n.term {
-				n.becomeFollowerLocked(ar.Term, "")
-			}
-			n.mu.Unlock()
+			rn.replicateToPeer(term, pp)
 		}(p)
 	}
+	wg.Wait()
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
+func (rn *RaftNode) replicateToPeer(term uint64, p peer) {
+	for {
+		rn.mu.Lock()
+		// step down guard
+		if rn.role != leader || rn.term != term {
+			rn.mu.Unlock()
+			return
+		}
+		next := rn.nextIndex[p.ID]
+		if next == 0 {
+			next = rn.log.LastIndex()
+		}
+		prevIdx := next - 1
+		prevTerm := rn.log.Term(prevIdx)
+		entries := rn.log.Slice(next)
+		req := AppendEntriesRequest{
+			Term:         rn.term,
+			LeaderID:     rn.id,
+			PrevLogIndex: prevIdx,
+			PrevLogTerm:  prevTerm,
+			Entries:      entries,
+			LeaderCommit: rn.commitIndex,
+		}
+		rn.mu.Unlock()
+
+		ok, respTerm, conflictIdx, conflictTerm := rn.sendAppendEntries(p, req)
+		rn.mu.Lock()
+		// term changed?
+		if respTerm > rn.term {
+			rn.term = respTerm
+			rn.role = follower
+			rn.votedFor = ""
+			rn.mu.Unlock()
+			return
+		}
+		if ok {
+			// follower stored entries; advance next/match
+			newMatch := req.PrevLogIndex + uint64(len(entries))
+			rn.matchIndex[p.ID] = newMatch
+			rn.nextIndex[p.ID] = newMatch + 1
+			rn.maybeAdvanceCommit()
+			rn.mu.Unlock()
+			return // sent all outstanding entries
+		}
+		// back off nextIndex based on conflict hint
+		if conflictIdx > 0 {
+			// naive backoff: jump to conflict index
+			rn.nextIndex[p.ID] = conflictIdx
+		} else if rn.nextIndex[p.ID] > 1 {
+			rn.nextIndex[p.ID]--
+		}
+		_ = conflictTerm
+		rn.mu.Unlock()
+
+		// small pause to prevent tight spinning
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (rn *RaftNode) maybeAdvanceCommit() {
+	// Only leader calls this under lock.
+	// Find the highest N > commitIndex such that a majority have matchIndex >= N AND log[N].Term == currentTerm.
+	N := rn.commitIndex + 1
+	last := rn.log.LastIndex()
+	for n := last; n > rn.commitIndex; n-- {
+		if rn.log.Term(n) != rn.term {
+			continue
+		}
+		count := 1 // leader itself
+		for _, p := range rn.peers {
+			if p.ID == rn.id {
+				continue
+			}
+			if rn.matchIndex[p.ID] >= n {
+				count++
+			}
+		}
+		if count*2 > len(rn.peers) { // majority
+			rn.commitIndex = n
+			go rn.signalWaitersUpTo(n)
+			go rn.applyLoopKick()
+			break
+		}
+	}
+}
+
+func (rn *RaftNode) signalWaitersUpTo(n uint64) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	for idx := range rn.waiters {
+		if idx <= n {
+			for _, ch := range rn.waiters[idx] {
+				select { case ch <- struct{}{}: default: }
+			}
+			delete(rn.waiters, idx)
+		}
+	}
+}
+
+// ---------- Apply loop ----------
+
+// applyLoopKick nudges the applier; lightweight and safe to call often.
+func (rn *RaftNode) applyLoopKick() {
+	go rn.applyCommitted()
+}
+
+func (rn *RaftNode) applyCommitted() {
+	for {
+		rn.mu.Lock()
+		if rn.lastApplied >= rn.commitIndex {
+			rn.mu.Unlock()
+			return
+		}
+		rn.lastApplied++
+		ent, _ := rn.log.At(rn.lastApplied)
+		msg := ApplyMsg{Index: ent.Index, Term: ent.Term, Data: ent.Data}
+		rn.mu.Unlock()
+
+		select {
+		case rn.applyCh <- msg:
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// ---------- RPC plumbing (AppendEntries handler & client) ----------
+
+func (rn *RaftNode) HandleAppendEntries(w http.ResponseWriter, r *http.Request) {
+	var req AppendEntriesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	resp := AppendEntriesResponse{Term: rn.term, Success: false}
+
+	if req.Term < rn.term {
+		writeJSON(w, resp); return
+	}
+
+	// If term is newer, become follower
+	if req.Term > rn.term {
+		rn.term = req.Term
+		rn.role = follower
+		rn.votedFor = ""
+	}
+	// reset election timer because we heard from leader
+	rn.resetElectionTimerLocked()
+
+	// Log consistency check
+	if req.PrevLogIndex > rn.log.LastIndex() || rn.log.Term(req.PrevLogIndex) != req.PrevLogTerm {
+		// Simple conflict hint
+		resp.ConflictIndex = minU64(req.PrevLogIndex, rn.log.LastIndex())
+		resp.ConflictTerm = rn.log.Term(resp.ConflictIndex)
+		writeJSON(w, resp); return
+	}
+
+	// Append new entries, deleting conflicts
+	for i, e := range req.Entries {
+		pos := req.PrevLogIndex + 1 + uint64(i)
+		if pos <= rn.log.LastIndex() {
+			if rn.log.Term(pos) != e.Term {
+				rn.log.TruncateFrom(pos)
+				rn.log.Append(e)
+			} else {
+				// already present; skip
+			}
+		} else {
+			rn.log.Append(e)
+		}
+	}
+
+	// Advance commit index
+	if req.LeaderCommit > rn.commitIndex {
+		rn.commitIndex = minU64(req.LeaderCommit, rn.log.LastIndex())
+		go rn.applyLoopKick()
+	}
+
+	resp.Success = true
+	resp.Term = rn.term
+	writeJSON(w, resp)
+}
+
+func (rn *RaftNode) sendAppendEntries(p peer, req AppendEntriesRequest) (ok bool, term uint64, cidx uint64, cterm uint64) {
+	b, _ := json.Marshal(&req)
+	ctx, cancel := context.WithTimeout(rn.ctx, 2*time.Second)
+	defer cancel()
+	httpReq, _ := http.NewRequestWithContext(ctx, "POST", p.Addr+"/raft/append", bytes.NewReader(b))
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := rn.httpClient.Do(httpReq)
+	if err != nil {
+		return false, rn.term, 0, 0
+	}
+	defer resp.Body.Close()
+	var ar AppendEntriesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
+		return false, rn.term, 0, 0
+	}
+	return ar.Success, ar.Term, ar.ConflictIndex, ar.ConflictTerm
+}
+
+// ---------- Timer helpers (unchanged structure, now nudging apply/heartbeats) ----------
+
+func (rn *RaftNode) resetElectionTimer() {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	rn.resetElectionTimerLocked()
+}
+
+func (rn *RaftNode) resetElectionTimerLocked() {
+	if rn.electionTimer != nil {
+		rn.electionTimer.Stop()
+	}
+	d := randomElectionTimeout()
+	rn.electionTimer = time.NewTimer(d)
+}
+
+// (Assume you already have code that: followers -> candidate on timeout,
+// RequestVote RPCs, leader sends empty AppendEntries as heartbeats, etc.)
+
+// Utility
+
+func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func minU64(a, b uint64) uint64 {
+	if a < b { return a }
+	return b
 }
