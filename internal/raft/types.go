@@ -10,21 +10,19 @@ type Entry struct {
 }
 
 type AppendEntriesRequest struct {
-	Term         uint64
-	LeaderID     string
-	PrevLogIndex uint64
-	PrevLogTerm  uint64
-	Entries      []Entry
-	LeaderCommit uint64
+    Term         uint64  `json:"term"`
+    LeaderID     string  `json:"leader_id"`
+    PrevLogIndex uint64  `json:"prev_log_index"`
+    PrevLogTerm  uint64  `json:"prev_log_term"`
+    Entries      []Entry `json:"entries"`
+    LeaderCommit uint64  `json:"leader_commit"`
 }
 
 type AppendEntriesResponse struct {
-	Term    uint64
-	Success bool
-
-	// Optional fast-backoff hint (see §5.3 optimization). Keep simple for now.
-	ConflictIndex uint64
-	ConflictTerm  uint64
+    Term          uint64 `json:"term"`
+    Success       bool   `json:"success"`
+    ConflictIndex uint64 `json:"conflict_index,omitempty"`
+    ConflictTerm  uint64 `json:"conflict_term,omitempty"`
 }
 
 type ApplyMsg struct {

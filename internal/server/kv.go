@@ -114,3 +114,68 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+type ClientSession struct {
+    LastReqID int64
+    LastResult []byte // could store serialized response
+}
+
+type KVStore struct {
+    mu        sync.Mutex
+    store     map[string]string
+    sessions  map[string]*ClientSession
+}
+
+func NewKVStore() *KVStore {
+    return &KVStore{
+        store:    make(map[string]string),
+        sessions: make(map[string]*ClientSession),
+    }
+}
+
+type Command struct {
+    ClientID string
+    ReqID    int64
+    Op       string // "PUT", "DELETE", "GET"
+    Key      string
+    Value    string
+}
+
+type Result struct {
+    Value string
+    Ok    bool
+}
+
+func (kv *KVStore) Apply(cmd Command) Result {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+
+    // Check if we have seen this request already
+    if sess, ok := kv.sessions[cmd.ClientID]; ok {
+        if cmd.ReqID <= sess.LastReqID {
+            // Duplicate or old request
+            return Result{Value: string(sess.LastResult), Ok: true}
+        }
+    }
+
+    var res Result
+    switch cmd.Op {
+    case "PUT":
+        kv.store[cmd.Key] = cmd.Value
+        res = Result{Ok: true}
+    case "DELETE":
+        delete(kv.store, cmd.Key)
+        res = Result{Ok: true}
+    case "GET":
+        v, ok := kv.store[cmd.Key]
+        res = Result{Value: v, Ok: ok}
+    }
+
+    // Update session record
+    kv.sessions[cmd.ClientID] = &ClientSession{
+        LastReqID:  cmd.ReqID,
+        LastResult: []byte(res.Value),
+    }
+
+    return res
+}
