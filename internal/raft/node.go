@@ -28,8 +28,20 @@ type Config struct {
 	Logger    *log.Logger
 }
 
-type Node struct {
-	mu sync.Mutex
+type Node struct {mu sync.Mutex
+
+	// Persistent state on all servers
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
+
+	// Volatile state on all servers
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders
+	nextIndex  map[int]int
+	matchIndex map[int]intmu sync.Mutex
 
 	// identity
 	id        string
