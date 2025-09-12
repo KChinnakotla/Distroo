@@ -107,6 +107,27 @@ func NewNode(cfg Config) *Node {
 	return n
 }
 
+// apply loop: sends committed but unapplied entries to applyCh
+// This is a simple implementation; in production, consider batching and more efficient handling
+
+func (rn *RaftNode) StartApplyLoop(applyCh chan<- LogEntry) {
+	go func() {
+		for {
+			time.Sleep(10 * time.Millisecond) // small delay to avoid busy looping
+
+			rn.mu.Lock()
+			// Apply entries between lastApplied and commitIndex
+			for rn.lastApplied < rn.commitIndex {
+				rn.lastApplied++
+				entry := rn.log[rn.lastApplied-1] // log is 0-indexed
+				applyCh <- entry                  // send to KV layer
+				log.Printf("[Node %v] Applied entry %d (term %d)", rn.ID, entry.Index, entry.Term)
+			}
+			rn.mu.Unlock()
+		}
+	}()
+}
+
 // IsLeader returns whether this node is leader
 func (n *Node) IsLeader() bool {
 	n.mu.Lock()
