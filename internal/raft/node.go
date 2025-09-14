@@ -109,6 +109,37 @@ func NewNode(cfg Config) *Node {
 
 // apply loop: sends committed but unapplied entries to applyCh
 // This is a simple implementation; in production, consider batching and more efficient handling
+func (rn *RaftNode) UpdateCommitIndex() {
+	if rn.role != Leader {
+		return
+	}
+
+	N := len(rn.peers) // total number of nodes
+	// Collect matchIndex for all peers, including leader itself
+	matchIndexes := make([]int, 0, N)
+	for _, m := range rn.matchIndex {
+		matchIndexes = append(matchIndexes, m)
+	}
+	matchIndexes = append(matchIndexes, rn.logLastIndex())
+
+	// Sort and pick the majority value
+	sort.Ints(matchIndexes)
+	majorityIndex := matchIndexes[(N)/2]
+
+	// Advance commitIndex if the entry at majorityIndex is from the current term
+	if majorityIndex > rn.commitIndex && rn.log[majorityIndex-1].Term == rn.currentTerm {
+		rn.commitIndex = majorityIndex
+		log.Printf("[Leader %v] CommitIndex advanced to %d", rn.ID, rn.commitIndex)
+	}
+}
+
+// logLastIndex returns the index of the last log entry.
+func (rn *RaftNode) logLastIndex() int {
+	if len(rn.log) == 0 {
+		return 0
+	}
+	return rn.log[len(rn.log)-1].Index
+}
 
 func (rn *RaftNode) StartApplyLoop(applyCh chan<- LogEntry) {
 	go func() {
