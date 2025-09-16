@@ -141,6 +141,37 @@ func (rn *RaftNode) logLastIndex() int {
 	return rn.log[len(rn.log)-1].Index
 }
 
+func (rn *RaftNode) HandleAppendEntriesResponse(followerID int, success bool, matchIdx int) {
+    rn.mu.Lock()
+    defer rn.mu.Unlock()
+
+    if rn.role != Leader {
+        return
+    }
+
+    if success {
+        // Update matchIndex for follower
+        rn.matchIndex[followerID] = matchIdx
+        rn.nextIndex[followerID] = matchIdx + 1
+        log.Printf("[Leader %v] Follower %d replicated up to %d", rn.ID, followerID, matchIdx)
+
+        // Try to advance commitIndex
+        rn.UpdateCommitIndex()
+    } else {
+        // Conflict: back off nextIndex for follower
+        rn.nextIndex[followerID] = max(1, rn.nextIndex[followerID]-1)
+        log.Printf("[Leader %v] Follower %d rejected AppendEntries, nextIndex=%d",
+            rn.ID, followerID, rn.nextIndex[followerID])
+    }
+}
+
+func max(a, b int) int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
 func (rn *RaftNode) StartApplyLoop(applyCh chan<- LogEntry) {
 	go func() {
 		for {
